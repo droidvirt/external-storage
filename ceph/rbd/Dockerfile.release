@@ -22,10 +22,15 @@ RUN go build -a -ldflags '-extldflags "-static"' -o /go/bin/rbd-provisioner main
 FROM centos:7
 
 ENV CEPH_VERSION "nautilus"
-RUN rpm -Uvh https://download.ceph.com/rpm-$CEPH_VERSION/el7/noarch/ceph-release-1-1.el7.noarch.rpm && \
+RUN rpm -Uvh http://mirrors.ustc.edu.cn/ceph/rpm-$CEPH_VERSION/el7/noarch/ceph-release-1-1.el7.noarch.rpm && \
   yum install -y epel-release && \
   yum install -y --nogpgcheck ceph-common && \
   yum clean all
+
+# https://github.com/kubernetes/kubernetes/pull/75588#discussion_r299549012
+RUN mkdir -p /etc/ceph && \
+  touch /etc/ceph/ceph.conf && \
+  touch /etc/ceph/keyring
 
 COPY --from=build /go/bin/rbd-provisioner /usr/local/bin/rbd-provisioner
 ENTRYPOINT ["/usr/local/bin/rbd-provisioner"]

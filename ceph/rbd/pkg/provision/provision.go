@@ -17,6 +17,7 @@ limitations under the License.
 package provision
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -79,6 +80,16 @@ type rbdProvisionOptions struct {
 	// imageFormat to "2". Currently supported features are layering only.
 	// Default is "", and no features are turned on.
 	imageFeatures []string
+	// embed provision clone info into PVC annotation
+	cloneOptionAnnotation string
+}
+
+// CloneProvisionInfo is embed json object at annotation[cloneOptionAnnotation]
+type CloneProvisionInfo struct {
+	SrcImage  string            `json:"srcImage"`
+	SrcPool   string            `json:"srcPool,omitempty"`
+	DestPool  string            `json:"destPool,omitempty"`
+	ImageMeta map[string]string `json:"imageMeta,omitempty"`
 }
 
 type rbdProvisioner struct {
@@ -126,13 +137,56 @@ func (p *rbdProvisioner) Provision(options controller.VolumeOptions) (*v1.Persis
 	if err != nil {
 		return nil, err
 	}
+
+	cloneInfo, err := func() (*CloneProvisionInfo, error) {
+		// check whether clone provison
+		if len(opts.cloneOptionAnnotation) != 0 {
+			if cloneData, exists := options.PVC.ObjectMeta.Annotations[opts.cloneOptionAnnotation]; exists {
+				var info CloneProvisionInfo
+				if err = json.Unmarshal([]byte(cloneData), &info); err != nil {
+					klog.Warningf("failed to parse clone provision info, raw data: %v", cloneData)
+					return nil, fmt.Errorf("failed to parse clone provision info: %v", err)
+				}
+				klog.Infof("Parse CloneProvisionInfo: %v, from: %s", info, cloneData)
+				return &info, nil
+			}
+		}
+		return nil, nil
+	}()
+	if err != nil {
+		return nil, err
+	}
+
 	image := options.PVName
 	// If use-pv-name flag not set, generate image name
 	if !p.usePVName {
 		// create random image name
 		image = fmt.Sprintf("kubernetes-dynamic-pvc-%s", uuid.NewUUID())
 	}
-	rbd, sizeMB, err := p.rbdUtil.CreateImage(image, opts, options)
+
+	rbd, sizeMB, err := func() (*v1.RBDPersistentVolumeSource, int, error) {
+		if cloneInfo != nil {
+			if cloneInfo.DestPool == "" {
+				cloneInfo.DestPool = opts.pool
+			}
+			if cloneInfo.SrcPool == "" {
+				cloneInfo.SrcPool = opts.pool
+			}
+			pv, size, err := p.rbdUtil.CopyImage(image, cloneInfo.DestPool, cloneInfo.SrcImage, cloneInfo.SrcPool, opts, options)
+			if err != nil {
+				return pv, size, err
+			}
+			for key, value := range cloneInfo.ImageMeta {
+				if err := p.rbdUtil.SetImageMeta(image, cloneInfo.DestPool, opts, key, value); err != nil {
+					klog.Warningf("RBD image(%s/%s) err: %v", image, cloneInfo.DestPool, err)
+				}
+			}
+			return pv, size, nil
+		} else {
+			return p.rbdUtil.CreateImage(image, opts.pool, opts, options)
+		}
+	}()
+
 	if err != nil {
 		klog.Errorf("rbd: create volume failed, err: %v", err)
 		return nil, err
@@ -146,12 +200,20 @@ func (p *rbdProvisioner) Provision(options controller.VolumeOptions) (*v1.Persis
 	}
 	rbd.RadosUser = opts.userID
 
+	pvAnnotation := map[string]string{
+		provisionerIDAnn: p.identity,
+	}
+	if cloneInfo != nil {
+		cloneData, err := json.Marshal(cloneInfo)
+		if err == nil {
+			pvAnnotation["cloneInfo"] = string(cloneData)
+		}
+	}
+
 	pv := &v1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: options.PVName,
-			Annotations: map[string]string{
-				provisionerIDAnn: p.identity,
-			},
+			Name:        options.PVName,
+			Annotations: pvAnnotation,
 		},
 		Spec: v1.PersistentVolumeSpec{
 			PersistentVolumeReclaimPolicy: options.PersistentVolumeReclaimPolicy,
@@ -196,7 +258,8 @@ func (p *rbdProvisioner) Delete(volume *v1.PersistentVolume) error {
 		return err
 	}
 	image := volume.Spec.PersistentVolumeSource.RBD.RBDImage
-	return p.rbdUtil.DeleteImage(image, opts)
+	pool := volume.Spec.PersistentVolumeSource.RBD.RBDPool
+	return p.rbdUtil.DeleteImage(image, pool, opts)
 }
 
 func (p *rbdProvisioner) parseParameters(parameters map[string]string) (*rbdProvisionOptions, error) {
@@ -286,6 +349,8 @@ func (p *rbdProvisioner) parseParameters(parameters map[string]string) (*rbdProv
 				}
 				opts.imageFeatures = append(opts.imageFeatures, f)
 			}
+		case "cloneoptionannotation":
+			opts.cloneOptionAnnotation = v
 		case volume.VolumeParameterFSType:
 			opts.fsType = v
 		default:

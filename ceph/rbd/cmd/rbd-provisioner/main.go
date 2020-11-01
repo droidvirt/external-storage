@@ -43,8 +43,22 @@ const (
 )
 
 func main() {
-	flag.Parse()
 	flag.Set("logtostderr", "true")
+	flag.Set("v", "5")
+	flag.Set("stderrthreshold", "INFO")
+	flag.Parse()
+
+	// co-exist glog and klog
+	klogFlags := flag.NewFlagSet("klog", flag.ExitOnError)
+	klog.InitFlags(klogFlags)
+	// Sync the glog and klog flags.
+	flag.CommandLine.VisitAll(func(f1 *flag.Flag) {
+		f2 := klogFlags.Lookup(f1.Name)
+		if f2 != nil {
+			value := f1.Value.String()
+			f2.Value.Set(value)
+		}
+	})
 
 	var config *rest.Config
 	var err error
